@@ -356,6 +356,10 @@ relative to their own location, so an absolute path works from anywhere:
 **A few files fail** — the run continues and records them. Run the same command
 again; completed files are skipped.
 
+## License
+
+MIT — see [LICENSE](LICENSE).
+
 ## Development
 
 ```
