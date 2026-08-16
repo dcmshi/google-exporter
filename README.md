@@ -20,6 +20,10 @@ Gmail. Nothing is hardcoded to a particular address or domain.
   folder in the destination, converting the Office files back to native Google
   formats.
 - **`auth_paste.py`** — fallback sign-in for when the normal browser flow hangs.
+- **`export_tabs.py`** — audits which Docs use tabs, and can export each tab as
+  its own file. Needs the Docs API enabled.
+- **`clear_flattened.py`** — lists, and optionally trashes, the flattened copies
+  of tabbed Docs so you can replace them with native copies.
 
 Both main scripts are resumable and idempotent. Re-running skips whatever
 already finished, so a partial failure just needs the same command again.
@@ -267,6 +271,7 @@ The **"Owned by"** breakdown in the same output confirms which case you are in.
 | Thing | What happens |
 |---|---|
 | Version history | Lost. Files arrive as a single new revision. |
+| **Google Docs tabs** | **Flattened.** All tab content survives, concatenated into one linear document in tab order, but the tab structure is gone. See below. |
 | Comments | Preserved for Docs/Sheets/Slides via the Office formats; resolved threads may flatten. |
 | Sharing permissions | Not copied. Re-share manually. |
 | Google Forms, Sites, My Maps | No export API exists. Listed in `index.csv`; handle by hand. |
@@ -280,6 +285,69 @@ destination, then use **Make a copy** in Drive. That keeps native format
 throughout but leaves you with no local backup, so running the export anyway is
 worthwhile.
 
+### Google Docs tabs are flattened
+
+Google Docs [tabs](https://support.google.com/docs/answer/15499791) have no
+equivalent in `.docx`, so a seven-tab document exports as one continuous file
+with the seven sections stacked in order. Re-imported, it is a single doc where
+each former tab reads as a big heading.
+
+**No text is lost.** This was worth measuring rather than assuming: exporting
+each tab individually via the Docs API and summing the results gives essentially
+the same character count as the single flattened export (for one 7-tab document,
+5,058 characters across tabs versus 5,161 in the flat file — the difference is
+per-file boilerplate, not content). Every format Drive offers behaves the same
+way; `.docx`, `.odt`, `.html`, `.rtf`, `.epub` and `.txt` all produce the
+identical flattened text.
+
+To find out whether this affects you:
+
+```
+uv run export_tabs.py --expect-email source@example.com
+```
+
+Read-only. It prints every Doc with more than one tab, and the tab titles.
+
+**There is no automated way to rebuild the tabs.** The Docs API does expose an
+`addDocumentTab` request, and `EndOfSegmentLocation` accepts a `tabId`, so tabs
+*can* be created programmatically. But populating them means reconstructing
+every paragraph, style, table and inline image as a `batchUpdate` request, and
+anything not explicitly handled vanishes silently. That trades a known,
+harmless flattening for unpredictable fidelity loss.
+
+**Use a native copy instead.** For the affected documents only:
+
+1. `uv run clear_flattened.py --expect-email dest@example.com` to list them, then
+   add `--trash` to remove the flattened versions (recoverable for 30 days).
+2. In the source Drive, share those documents with the destination account.
+3. In the destination Drive, open **Shared with me**, select them, and choose
+   **Make a copy**.
+
+Copies made this way are owned by the destination account and keep tabs,
+formatting, images, tables and comments intact, because Google never converts
+the file. This is normally a handful of documents, so it is quicker by hand than
+any script — and scripting it would need full `drive` write scope on both
+accounts.
+
+If you would rather have each tab as a separate document,
+`uv run export_tabs.py --expect-email source@example.com --apply` writes one
+`.docx` per tab and a `manifest_tabs.json`, which the normal importer accepts:
+
+```
+uv run import_drive.py --manifest manifest_tabs.json --expect-email dest@example.com
+```
+
+### Sheets with multiple worksheets are fine
+
+`.xlsx` supports multiple worksheets natively, so multi-tab spreadsheets survive
+intact — worksheet names, order and cell contents all round-trip.
+
+One cosmetic difference: Google drops empty-but-formatted cells on the way back
+in, so a workbook can report several hundred fewer cells after the round trip.
+That is styling on blank cells, not data. Verified on two workbooks that each
+showed ~780 fewer cell elements: cells actually containing a value were
+identical (52 → 52 and 36 → 36), and every distinct text string was present.
+
 ## Files this creates
 
 | File | Purpose |
@@ -290,6 +358,7 @@ worthwhile.
 | `index.csv` | Same data, spreadsheet-friendly. |
 | `import_map.json` | Which local paths already uploaded, so re-runs don't duplicate. |
 | `export/` | The downloaded files. |
+| `manifest_tabs.json` / `export_tabs/` | Per-tab exports, only if you ran `export_tabs.py --apply`. |
 
 Everything except the scripts is gitignored. `manifest.json`, `index.csv` and
 `import_map.json` list your private file names and Drive IDs — treat them as

@@ -6,7 +6,9 @@ token_*.json
 
 # Run artifacts - these contain your private file names, Drive IDs and folder tree
 export/
+export_tabs/
 manifest.json
+manifest_tabs.json
 index.csv
 import_map.json
 
