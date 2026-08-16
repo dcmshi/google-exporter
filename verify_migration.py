@@ -39,8 +39,10 @@ import hashlib
 import html
 import io
 import json
+import random
 import re
 import sys
+import time
 import zipfile
 from pathlib import Path
 from urllib.parse import quote
@@ -163,26 +165,75 @@ def sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def export_bytes(session, file_id: str, mime: str) -> bytes:
-    url = (
+class ExportFailed(Exception):
+    def __init__(self, status: int, body: str):
+        self.status = status
+        self.body = body
+        super().__init__(f"HTTP {status}: {body[:160]}")
+
+
+def _fetch(session, url: str, tries: int = 5) -> bytes:
+    """Follow redirects manually so the bearer token survives the hop.
+
+    Retries network faults and 5xx/429 here rather than leaving it to the outer
+    helper, which cannot tell a permanent 403 from a transient one and would
+    burn six backoffs on something that will never succeed.
+    """
+    last = None
+    for attempt in range(tries):
+        target = url
+        try:
+            for _ in range(6):
+                r = session.get(target, allow_redirects=False, timeout=600)
+                if r.status_code in (301, 302, 303, 307, 308) and "location" in r.headers:
+                    target = r.headers["location"]
+                    continue
+                break
+            else:
+                raise ExportFailed(0, "too many redirects")
+
+            if r.status_code < 400:
+                return r.content
+            if r.status_code in (429, 500, 502, 503, 504):
+                last = ExportFailed(r.status_code, r.text[:300])
+            else:
+                raise ExportFailed(r.status_code, r.text[:300])
+        except (OSError, ConnectionError) as exc:  # includes requests' SSLError
+            last = exc
+        time.sleep(min(2**attempt, 30) + random.uniform(0, 1))
+    raise last or ExportFailed(0, "export failed")
+
+
+def export_bytes(session, file_id: str, mime: str, export_link: str | None = None) -> bytes:
+    """Export via the API host; fall back to exportLinks only when it must.
+
+    The /export endpoint is served by googleapis.com and is the reliable path,
+    but it refuses files over 10MB. exportLinks has no size cap yet is served by
+    googleusercontent.com, which is noticeably flakier - so it is the fallback,
+    not the default.
+    """
+    rest = (
         f"https://www.googleapis.com/drive/v3/files/{file_id}/export"
         f"?mimeType={quote(mime)}"
     )
-    for _ in range(6):
-        r = session.get(url, stream=False, allow_redirects=False, timeout=600)
-        if r.status_code in (301, 302, 303, 307, 308) and "location" in r.headers:
-            url = r.headers["location"]
-            continue
-        r.raise_for_status()
-        return r.content
-    raise RuntimeError("too many redirects")
+    try:
+        return _fetch(session, rest)
+    except ExportFailed as exc:
+        oversized = "exportSizeLimitExceeded" in exc.body
+        if export_link and oversized:
+            return _fetch(session, export_link)
+        raise
 
 
 def fingerprint(session, service, file_id: str, mime: str) -> tuple[str, str]:
     """('md5'|'text', hash) - md5 is byte-exact, text is content-exact."""
     meta = with_retry(
         lambda: service.files()
-        .get(fileId=file_id, fields="md5Checksum,mimeType,size", supportsAllDrives=True)
+        .get(
+            fileId=file_id,
+            fields="md5Checksum,mimeType,size,exportLinks",
+            supportsAllDrives=True,
+        )
         .execute(),
         label=file_id,
     )
@@ -191,7 +242,10 @@ def fingerprint(session, service, file_id: str, mime: str) -> tuple[str, str]:
     export_mime = EXPORT_AS.get(mime)
     if not export_mime:
         return "skip", ""
-    data = with_retry(lambda: export_bytes(session, file_id, export_mime), label=file_id)
+    link = (meta.get("exportLinks") or {}).get(export_mime)
+    data = with_retry(
+        lambda: export_bytes(session, file_id, export_mime, link), label=file_id
+    )
     return "text", sha(content_of(mime, data))
 
 
@@ -204,6 +258,14 @@ def main() -> int:
     ap.add_argument("--dest-profile", default="dest_verify")
     ap.add_argument("--dest-scope", choices=["readonly", "file"], default="readonly")
     ap.add_argument("--only-problems", action="store_true")
+    ap.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="check only files whose name contains NAME; repeatable. Use to re-check "
+        "a few stragglers without re-exporting everything.",
+    )
     ap.add_argument("--limit", type=int)
     args = ap.parse_args()
 
@@ -226,6 +288,11 @@ def main() -> int:
     print(f"source: {src_account}\ndest:   {dst_account}\n")
 
     entries = [e for e in manifest["files"] if e["status"] in ("ok", "skipped-exists")]
+    if args.only:
+        wanted = [w.lower() for w in args.only]
+        entries = [e for e in entries if any(w in e["name"].lower() for w in wanted)]
+        if not entries:
+            sys.exit(f"Nothing in the manifest matches {args.only}")
     if args.limit:
         entries = entries[: args.limit]
 
@@ -245,18 +312,33 @@ def main() -> int:
         if args.dest_scope != "readonly":
             return None, "trashed" if found_trashed else "missing"
 
-        # Manual copies aren't in import_map; Drive appends "Copy of" sometimes.
-        base = entry["name"].rsplit(".", 1)[0].replace("'", "\\'")
-        q = f"name = '{base}' and trashed = false"
-        res = with_retry(
-            lambda: dst_svc.files().list(q=q, fields="files(id,name)", pageSize=10).execute(),
-            label=base,
-        )
-        hits = res.get("files", [])
-        if len(hits) == 1:
-            return hits[0]["id"], "by-name"
-        if len(hits) > 1:
-            return hits[0]["id"], "ambiguous"
+        # Manual copies aren't in import_map, and Drive's "Make a copy" prefixes
+        # the name with "Copy of" unless you rename it.
+        base = entry["name"].rsplit(".", 1)[0].replace("\\", "\\\\").replace("'", "\\'")
+        # "'me' in owners" matters: with read-only Drive access the SOURCE file
+        # also shows up here as shared-with-me, and matching it would compare the
+        # source against itself and report a meaningless pass.
+        mine = "and 'me' in owners and trashed = false"
+        queries = [
+            (f"name = '{base}' {mine}", "by-name"),
+            (f"name = 'Copy of {base}' {mine}", "copy-of"),
+            (f"name contains '{base}' {mine}", "fuzzy"),
+        ]
+        for q, via_label in queries:
+            try:
+                res = with_retry(
+                    lambda: dst_svc.files()
+                    .list(q=q, fields="files(id,name)", pageSize=10)
+                    .execute(),
+                    label=base,
+                )
+            except Exception:  # noqa: BLE001 - a malformed query shouldn't end the run
+                continue
+            hits = res.get("files", [])
+            if len(hits) == 1:
+                return hits[0]["id"], via_label
+            if len(hits) > 1:
+                return hits[0]["id"], f"{via_label}?"
         return None, "trashed" if found_trashed else "missing"
 
     counts = {}

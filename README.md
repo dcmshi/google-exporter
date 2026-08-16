@@ -258,6 +258,20 @@ XML instead produces false alarms on all three — `EX PERIENCE` versus
 `EXPERIENCE` is the same word, and `w:color="auto"` versus `w:color="000000"`
 is the same black.
 
+Use `--only NAME` (repeatable) to re-check a few files without re-exporting
+everything — a full run exports every file from *both* accounts and takes
+minutes.
+
+Two `DIFFERS` results are expected rather than alarming:
+
+- **A natively copied doc whose tabs had default names.** Tab titles are written
+  into the export as headings, and Google auto-titles untitled tabs from their
+  content when copying — so `Tab 1` in the original becomes something like
+  `chat with CEO David Jeong` in the copy. The body text is identical; only the
+  heading differs.
+- **A file you edited after migrating.** The check compares against the source
+  as it is now, not as it was at export time.
+
 It also verifies files you copied by hand. The destination side defaults to
 read-only full-Drive access so it can find them; that is a separate consent
 screen from the import token. Pass `--dest-scope file` to reuse the narrow
