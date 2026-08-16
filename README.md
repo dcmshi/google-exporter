@@ -26,6 +26,8 @@ Gmail. Nothing is hardcoded to a particular address or domain.
   its own file. Needs the Docs API enabled.
 - **`clear_flattened.py`** — lists, and optionally trashes, the flattened copies
   of tabbed Docs so you can replace them with native copies.
+- **`final_audit.py`** — run this before giving up access to the source account.
+  Re-lists it live and catches anything created since the export.
 
 Both main scripts are resumable and idempotent. Re-running skips whatever
 already finished, so a partial failure just needs the same command again.
@@ -409,6 +411,105 @@ identical (52 → 52 and 36 → 36), and every distinct text string was present.
 Everything except the scripts is gitignored. `manifest.json`, `index.csv` and
 `import_map.json` list your private file names and Drive IDs — treat them as
 personal data even though they contain no file contents.
+
+## Before you cancel the subscription
+
+Losing the source account is irreversible, and a verification run only proves
+the files you *knew about* arrived. It cannot tell you about a document created
+after the export. Run this last:
+
+```
+uv run final_audit.py --expect-email source@example.com
+```
+
+It re-lists the source live, diffs it against the manifest, re-checks that every
+exported file is on disk and non-empty, restates what was never recoverable, and
+prints `SAFE TO CANCEL` or `DO NOT CANCEL YET`. Exit status matches, so it works
+in a script.
+
+Keep the local `export/` directory until you have opened a few documents in the
+destination and are satisfied. Also note that anything you trashed in the
+destination is recoverable from Drive's trash for only 30 days — the local copy
+is the durable one.
+
+## Gotchas
+
+Non-obvious things that cost real time here, kept so nobody re-derives them.
+
+### Google's export behavior
+
+- **`files.export` caps at 10MB.** Larger files return `403
+  exportSizeLimitExceeded`. The `exportLinks` URLs in a file's metadata have no
+  cap, so use those for anything big — but they are served by
+  `googleusercontent.com`, which is noticeably flakier than `googleapis.com`.
+  Best of both: API host by default, `exportLinks` only on a genuine size error.
+- **Redirects drop your credentials.** `exportLinks` redirects to a different
+  host, and `requests` strips the `Authorization` header on a cross-host
+  redirect. Follow redirects manually and re-attach the token, or every large
+  export 401s.
+- **Google files have no stable bytes.** Exporting the same untouched document
+  twice can differ in style-table numbering, shared-string ordering, and where a
+  styled word is split across formatting runs. Never compare Google-native files
+  by hashing raw exported bytes; compare extracted content.
+- **Docs tabs flatten, Sheets tabs do not.** See the fidelity section above.
+- **Empty-but-formatted cells vanish** on the way back into Sheets. A workbook
+  can report hundreds fewer cells with zero data loss. Count cells holding a
+  value, not `<c>` elements.
+- **The Docs API is separate from the Drive API** and must be enabled
+  separately. Drive scopes do not grant access to it.
+- **Shortcuts are not files.** A shortcut to a document owned by someone else
+  exports as nothing, and if your access to the target has lapsed it is gone —
+  it was never yours to export.
+
+### OAuth
+
+- **An OAuth client is not tied to the account that owns it.** A client created
+  under one account can authorize sign-in as any account on the test-user list.
+  Create the project wherever it is convenient.
+- **Unverified apps expire refresh tokens after 7 days.** Fine for a migration,
+  surprising if you come back later.
+- **A blank page after sign-in usually means HTTPS-Only Mode** upgraded
+  `http://localhost:PORT` and the local server could not answer. `auth_paste.py`
+  sidesteps the local server entirely.
+- **`drive.file` cannot see files it did not create.** That is the right scope
+  for importing, and the wrong one for verifying a copy you made by hand.
+- **Corporate TLS inspection breaks Google's export CDN.** Repeated `SSLError`
+  against `doc-*.googleusercontent.com` while `googleapis.com` works fine points
+  at local antivirus, not at Google.
+
+### Verifying, if you write your own checks
+
+- **`<w:t[^>]*>` also matches `<w:tbl>`, `<w:tc>` and `<w:tr>.`** Requiring a
+  space or `>` after the tag name (`<w:t(?:\s[^>]*)?>`) is the fix. Otherwise
+  table markup is extracted as document text.
+- **`<c r="A11" s="23"/>` is a styled empty cell.** Match the self-closing form
+  explicitly, or it is read as an open tag and swallows a later cell's value —
+  which reports data corruption that is not there.
+- **The source shows up as "shared with me"** in the destination once you share
+  it for a native copy. A name-based lookup will match it and compare the source
+  against itself, which passes and proves nothing. Scope queries with
+  `'me' in owners`.
+- **`requests.HTTPError` subclasses `OSError`.** A generic `except OSError`
+  retry loop will cheerfully retry a permanent 403 six times.
+- **Drive's "Make a copy" prefixes names with `Copy of`,** and auto-titles tabs
+  that were never named, so a copied doc can legitimately differ from its
+  original in tab headings alone.
+
+### Windows
+
+- **Paths break at 260 characters** unless prefixed with `\\?\`. Drive folder
+  names are long, and a Workspace transfer folder is named
+  `<email> <ISO timestamp>` — that alone is most of the budget.
+- **`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9` are reserved** and
+  cannot be filenames, even with an extension.
+- **`:` and `/` are legal in Drive names and illegal on Windows.** Timestamps in
+  folder names hit this immediately.
+- **Non-ASCII filenames crash a redirected stdout.** Drive names contain
+  en-dashes and emoji; reconfigure stdout to UTF-8 or a piped run dies on
+  `UnicodeEncodeError` partway through.
+- **Git Bash treats `\` as an escape character**, so `cd D:\project` silently
+  fails. Use `/d/project`, or invoke scripts by absolute path — they resolve
+  their own location, not your working directory.
 
 ## Troubleshooting
 
