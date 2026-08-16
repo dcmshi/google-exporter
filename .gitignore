@@ -1,0 +1,15 @@
+# Secrets - never commit these
+client_secret.json
+client_secret*.json
+token_*.json
+.pending_*.json
+
+# Run artifacts - these contain your private file names, Drive IDs and folder tree
+export/
+manifest.json
+index.csv
+import_map.json
+
+__pycache__/
+*.pyc
+.venv/
