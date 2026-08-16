@@ -36,6 +36,14 @@ def main() -> int:
     ap.add_argument("--client-secret", default="client_secret.json")
     ap.add_argument("--profile", default="dest")
     ap.add_argument("--trash", action="store_true", help="actually move them to the trash")
+    ap.add_argument(
+        "--doc",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="also target this document by name; repeatable. Use for single-tab docs, "
+        "which are not auto-detected but still lose their tab on export.",
+    )
     args = ap.parse_args()
 
     workdir = Path(__file__).resolve().parent
@@ -66,6 +74,23 @@ def main() -> int:
         src = src_by_path.get(rel_path)
         dest_id = state.get(f"file::{rel_path}")
         targets.append((doc_name, tab_count, src, dest_id, rel_path))
+
+    for wanted in args.doc:
+        matches = [
+            e for e in manifest["files"]
+            if wanted.lower() in e["name"].lower()
+            and e["mime_type"] == "application/vnd.google-apps.document"
+        ]
+        if not matches:
+            sys.exit(f"No Google Doc in the manifest matches {wanted!r}.")
+        if len(matches) > 1:
+            names = ", ".join(sorted(m["name"] for m in matches))
+            sys.exit(f"{wanted!r} is ambiguous - matches: {names}")
+        src = matches[0]
+        if any(t[4] == src["rel_path"] for t in targets):
+            continue
+        targets.append((src["name"], 1, src, state.get(f"file::{src['rel_path']}"),
+                        src["rel_path"]))
 
     print(f"{'document':<14} {'tabs':>4}  source (share this)")
     print("-" * 78)

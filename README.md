@@ -20,6 +20,8 @@ Gmail. Nothing is hardcoded to a particular address or domain.
   folder in the destination, converting the Office files back to native Google
   formats.
 - **`auth_paste.py`** — fallback sign-in for when the normal browser flow hangs.
+- **`verify_migration.py`** — proves the destination matches the source, file by
+  file, using md5 for binaries and content hashing for native Docs/Sheets/Slides.
 - **`export_tabs.py`** — audits which Docs use tabs, and can export each tab as
   its own file. Needs the Docs API enabled.
 - **`clear_flattened.py`** — lists, and optionally trashes, the flattened copies
@@ -230,6 +232,36 @@ Everything lands in one new folder named
 `Restored from source@example.com (<date>)`. Override with
 `--folder-name "My Docs"`, skip format conversion with `--no-convert`, or plan
 without uploading via `--dry-run`.
+
+### Step 4 — verify the destination matches the source
+
+```
+uv run verify_migration.py --source-email source@example.com --dest-email dest@example.com
+```
+
+Checks every file end to end and prints `MATCH`, `DIFFERS`, `MISSING` or
+`TRASHED` per file. Add `--only-problems` to hide the matches.
+
+A plain byte hash cannot work here, because Google files have no stable bytes —
+exporting the same untouched document twice can differ in boilerplate, style
+numbering and shared-string ordering. So the check adapts to the file type:
+
+| File type | Check |
+|---|---|
+| Binary (PDF, CSV, images, `.docx` uploaded as-is) | Drive's own `md5Checksum` on both sides. Byte-exact, and free — no download needed. |
+| Google Docs / Sheets / Slides | Export both sides to the same Office format, extract the content, normalize whitespace, compare SHA-256. |
+
+Content extraction deliberately ignores three things Google changes on every
+export, none of which are content: style-table numbering, shared-string index
+order, and where a styled word is split across formatting runs. Comparing raw
+XML instead produces false alarms on all three — `EX PERIENCE` versus
+`EXPERIENCE` is the same word, and `w:color="auto"` versus `w:color="000000"`
+is the same black.
+
+It also verifies files you copied by hand. The destination side defaults to
+read-only full-Drive access so it can find them; that is a separate consent
+screen from the import token. Pass `--dest-scope file` to reuse the narrow
+`import_drive.py` token instead, which only sees files this tool created.
 
 ## "The files show up in Docs/Sheets but Drive looks empty"
 
